@@ -20,6 +20,11 @@
 // after errors and Ctrl-C. Both backends write under the same filer directory
 // (/buckets/<bucket>), so path-specific filer settings apply to both.
 //
+// Reads and deletes visit objects in a shuffled (but seed-determined, so repeatable)
+// order rather than the order they were written. That avoids sequential-access
+// effects such as readahead and index locality. It does NOT make reads cold: data
+// written moments earlier can still be served from OS and server caches.
+//
 // Exit status: 0 ok, 1 errors or regression, 2 bad usage / baseline not comparable,
 // 130 interrupted.
 package main
@@ -300,6 +305,7 @@ type report struct {
 	Count         int        `json:"count_per_size"`
 	Runs          int        `json:"runs"`
 	Verify        bool       `json:"verify"`
+	AccessOrder   string     `json:"access_order"` // "shuffled"; files without it were sequential
 	Seed          int64      `json:"seed"`
 	TimeoutSec    float64    `json:"op_timeout_sec"`
 	PerRun        [][]result `json:"per_run"`
@@ -478,8 +484,15 @@ func benchBackend(ctx context.Context, c config, name string, be backend, size i
 	del := func(kind string) func(context.Context, int) (int64, error) {
 		return func(ctx context.Context, i int) (int64, error) { return 0, be.Delete(ctx, key(kind, i)) }
 	}
+	// Visit objects in a shuffled order, not the order they were written. The orders
+	// depend only on seed and size, so every backend and every run uses the same ones.
+	readOrder := shuffled(c.count, c.seed+size+1)
+	deleteOrder := shuffled(c.count, c.seed+size+2)
 	read := func(ctx context.Context, i int) (int64, error) {
-		return readObject(ctx, be, key("obj", i), data, c.verify)
+		return readObject(ctx, be, key("obj", readOrder[i]), data, c.verify)
+	}
+	delShuffled := func(ctx context.Context, i int) (int64, error) {
+		return 0, be.Delete(ctx, key("obj", deleteOrder[i]))
 	}
 
 	// Warmup (untimed): open connections and touch the write path.
@@ -493,7 +506,7 @@ func benchBackend(ctx context.Context, c config, name string, be backend, size i
 	fmt.Fprintf(os.Stderr, "  %s %s: read...\n", name, human(size))
 	r := runPhase(ctx, c, "read", size, c.count, read)
 	fmt.Fprintf(os.Stderr, "  %s %s: delete...\n", name, human(size))
-	d := runPhase(ctx, c, "delete", size, c.count, del("obj"))
+	d := runPhase(ctx, c, "delete", size, c.count, delShuffled)
 
 	out := []result{w, r, d}
 	for i := range out {
@@ -576,6 +589,15 @@ func checkComparable(base, cur report) error {
 	}
 	if base.Count != cur.Count {
 		diffs = append(diffs, fmt.Sprintf("count %d vs %d", base.Count, cur.Count))
+	}
+	order := func(s string) string { // results from before this field existed were sequential
+		if s == "" {
+			return "sequential"
+		}
+		return s
+	}
+	if order(base.AccessOrder) != order(cur.AccessOrder) {
+		diffs = append(diffs, fmt.Sprintf("access order %s vs %s", order(base.AccessOrder), order(cur.AccessOrder)))
 	}
 	if base.Verify != cur.Verify {
 		diffs = append(diffs, fmt.Sprintf("verify %v vs %v", base.Verify, cur.Verify))
@@ -673,6 +695,11 @@ func newRunID() string {
 		panic(err) // the OS random source failing is not recoverable
 	}
 	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b)
+}
+
+// shuffled returns a random permutation of 0..n-1 that is fully determined by seed.
+func shuffled(n int, seed int64) []int {
+	return rand.New(rand.NewSource(seed)).Perm(n)
 }
 
 // rotate shifts the backend order by `by`, so with several runs each backend
@@ -828,7 +855,7 @@ func run() int {
 	rep := report{
 		Time: time.Now().UTC().Format(time.RFC3339), RunID: runID, Label: *label, Backends: names,
 		S3Endpoint: *s3Endpoint, FilerEndpoint: *filerEndpoint, Bucket: *bucket,
-		Concurrency: *conc, Count: *count, Runs: *runs, Verify: *verify, Seed: *seed,
+		Concurrency: *conc, Count: *count, Runs: *runs, Verify: *verify, Seed: *seed, AccessOrder: "shuffled",
 		TimeoutSec: timeout.Seconds(), PerRun: perRun,
 		Summary: summarize(names, sizes, perRun),
 	}
